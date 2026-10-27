@@ -16,11 +16,12 @@ import KeyTable from "../core/input/keysym.js";
 import keysyms from "../core/input/keysymdef.js";
 import Keyboard from "../core/input/keyboard.js";
 import RFB from "../core/rfb.js";
+import WakeLockManager from './wakelock.js';
 import * as WebUtil from "./webutil.js";
 
 const PAGE_TITLE = "noVNC";
 
-const LINGUAS = ["cs", "de", "el", "es", "fr", "hr", "hu", "it", "ja", "ko", "nl", "pl", "pt_BR", "ru", "sv", "tr", "zh_CN", "zh_TW"];
+const LINGUAS = ["cs", "de", "el", "es", "fr", "hr", "hu", "it", "ja", "ko", "nl", "pl", "pt_BR", "ru", "sv", "tr", "uk", "zh_CN", "zh_TW"];
 
 const UI = {
 
@@ -36,6 +37,8 @@ const UI = {
 
     controlbarGrabbed: false,
     controlbarDrag: false,
+    controlbarMouseDownClientX: 0,
+    controlbarMouseDownOffsetX: 0,
     controlbarMouseDownClientY: 0,
     controlbarMouseDownOffsetY: 0,
 
@@ -45,6 +48,8 @@ const UI = {
     inhibitReconnect: true,
     reconnectCallback: null,
     reconnectPassword: null,
+
+    wakeLockManager: new WakeLockManager(),
 
     async start(options={}) {
         UI.customSettings = options.settings || {};
@@ -107,8 +112,11 @@ const UI = {
         }
 
         // Restore control bar position
-        if (WebUtil.readSetting('controlbar_pos') === 'right') {
-            UI.toggleControlbarSide();
+        const pos = WebUtil.readSetting('controlbar_pos');
+        if (['left', 'right', 'top', 'bottom'].includes(pos)) {
+            UI.toggleControlbarSide(pos);
+        } else {
+            UI.toggleControlbarSide('left');
         }
 
         UI.initFullscreen();
@@ -135,10 +143,8 @@ const UI = {
 
         let autoconnect = UI.getSetting('autoconnect');
         if (autoconnect === 'true' || autoconnect == '1') {
-            autoconnect = true;
             UI.connect();
         } else {
-            autoconnect = false;
             // Show the connect panel on first load unless autoconnecting
             UI.openConnectPanel();
         }
@@ -189,6 +195,7 @@ const UI = {
         UI.initSetting('repeaterID', '');
         UI.initSetting('reconnect', false);
         UI.initSetting('reconnect_delay', 5000);
+        UI.initSetting('keep_device_awake', false);
     },
     // Adds a link to the label elements on the corresponding input elements
     setupSettingLabels() {
@@ -371,6 +378,8 @@ const UI = {
         UI.addSettingChangeHandler('view_only', UI.updateViewOnly);
         UI.addSettingChangeHandler('show_dot');
         UI.addSettingChangeHandler('show_dot', UI.updateShowDotCursor);
+        UI.addSettingChangeHandler('keep_device_awake');
+        UI.addSettingChangeHandler('keep_device_awake', UI.updateRequestWakelock);
         UI.addSettingChangeHandler('host');
         UI.addSettingChangeHandler('port');
         UI.addSettingChangeHandler('path');
@@ -571,7 +580,15 @@ const UI = {
         }
     },
 
-    toggleControlbarSide() {
+    getControlbarPos() {
+        const anchor = document.getElementById('noVNC_control_bar_anchor');
+        if (anchor.classList.contains('noVNC_right')) return 'right';
+        if (anchor.classList.contains('noVNC_top')) return 'top';
+        if (anchor.classList.contains('noVNC_bottom')) return 'bottom';
+        return 'left';
+    },
+
+    toggleControlbarSide(pos) {
         // Temporarily disable animation, if bar is displayed, to avoid weird
         // movement. The transitionend-event will not fire when display=none.
         const bar = document.getElementById('noVNC_control_bar');
@@ -582,13 +599,12 @@ const UI = {
         }
 
         const anchor = document.getElementById('noVNC_control_bar_anchor');
-        if (anchor.classList.contains("noVNC_right")) {
-            WebUtil.writeSetting('controlbar_pos', 'left');
-            anchor.classList.remove("noVNC_right");
-        } else {
-            WebUtil.writeSetting('controlbar_pos', 'right');
-            anchor.classList.add("noVNC_right");
+
+        anchor.classList.remove('noVNC_right', 'noVNC_top', 'noVNC_bottom');
+        if (['right', 'top', 'bottom'].includes(pos)) {
+            anchor.classList.add(`noVNC_${pos}`);
         }
+        WebUtil.writeSetting('controlbar_pos', pos);
 
         // Consider this a movement of the handle
         UI.controlbarDrag = true;
@@ -598,19 +614,21 @@ const UI = {
     },
 
     showControlbarHint(show, animate=true) {
-        const hint = document.getElementById('noVNC_control_bar_hint');
+        const getPos = element =>
+            ['right', 'top', 'bottom'].find(pos =>
+                element.classList.contains(`noVNC_${pos}`)
+            ) ?? 'left';
 
-        if (animate) {
-            hint.classList.remove("noVNC_notransition");
-        } else {
-            hint.classList.add("noVNC_notransition");
-        }
+        const anchor = document.getElementById('noVNC_control_bar_anchor');
+        const anchorPos = getPos(anchor);
 
-        if (show) {
-            hint.classList.add("noVNC_active");
-        } else {
-            hint.classList.remove("noVNC_active");
-        }
+        document.querySelectorAll('.noVNC_control_bar_hint').forEach((hint) => {
+            const hintPos = getPos(hint.parentElement);
+            const shouldShow = show && (hintPos !== anchorPos);
+
+            hint.classList.toggle('noVNC_active', shouldShow);
+            hint.classList.toggle('noVNC_notransition', !animate || !shouldShow);
+        });
     },
 
     dragControlbarHandle(e) {
@@ -618,28 +636,62 @@ const UI = {
 
         const ptr = getPointerEvent(e);
 
-        const anchor = document.getElementById('noVNC_control_bar_anchor');
-        if (ptr.clientX < (window.innerWidth * 0.1)) {
-            if (anchor.classList.contains("noVNC_right")) {
-                UI.toggleControlbarSide();
+        let controlBarPos = UI.getControlbarPos();
+
+        if (ptr.clientX < (window.innerWidth * 0.1) &&
+            ptr.clientY > (window.innerHeight * 0.25) &&
+            ptr.clientY < (window.innerHeight * 0.75)) {
+            if (controlBarPos !== 'left') {
+                UI.toggleControlbarSide('left');
+                controlBarPos = 'left';
             }
-        } else if (ptr.clientX > (window.innerWidth * 0.9)) {
-            if (!anchor.classList.contains("noVNC_right")) {
-                UI.toggleControlbarSide();
+
+        } else if (ptr.clientX > (window.innerWidth * 0.9) &&
+                   ptr.clientY > (window.innerHeight * 0.25) &&
+                   ptr.clientY < (window.innerHeight * 0.75)) {
+            if (controlBarPos !== 'right') {
+                UI.toggleControlbarSide('right');
+                controlBarPos = 'right';
+            }
+
+        // Slightly increased height thresholds since 10% of the
+        // height proved small in practice
+        } else if (ptr.clientX > (window.innerWidth * 0.25) &&
+                   ptr.clientX < (window.innerWidth * 0.75) &&
+                   ptr.clientY < (window.innerHeight * 0.2)) {
+            if (controlBarPos !== 'top') {
+                UI.toggleControlbarSide('top');
+                controlBarPos = 'top';
+            }
+
+        } else if (ptr.clientX > (window.innerWidth * 0.25) &&
+                   ptr.clientX < (window.innerWidth * 0.75) &&
+                   ptr.clientY > (window.innerHeight * 0.8)) {
+            if (controlBarPos !== 'bottom') {
+                UI.toggleControlbarSide("bottom");
+                controlBarPos = 'bottom';
             }
         }
 
+        const isVertical = controlBarPos === 'left' || controlBarPos === 'right';
+
         if (!UI.controlbarDrag) {
-            const dragDistance = Math.abs(ptr.clientY - UI.controlbarMouseDownClientY);
+            const dragDistance = isVertical
+                ? Math.abs(ptr.clientY - UI.controlbarMouseDownClientY)
+                : Math.abs(ptr.clientX - UI.controlbarMouseDownClientX);
 
             if (dragDistance < dragThreshold) return;
 
             UI.controlbarDrag = true;
         }
 
-        const eventY = ptr.clientY - UI.controlbarMouseDownOffsetY;
-
-        UI.moveControlbarHandle(eventY);
+        if (isVertical) {
+            const eventY = ptr.clientY - UI.controlbarMouseDownOffsetY;
+            UI.moveControlbarHandle(eventY, true);
+        } else {
+            const eventX = ptr.clientX - UI.controlbarMouseDownOffsetX;
+            UI.moveControlbarHandle(eventX, false);
+        }
 
         e.preventDefault();
         e.stopPropagation();
@@ -648,41 +700,56 @@ const UI = {
     },
 
     // Move the handle but don't allow any position outside the bounds
-    moveControlbarHandle(viewportRelativeY) {
+    moveControlbarHandle(viewportRelativeCoord, isVertical) {
         const handle = document.getElementById("noVNC_control_bar_handle");
-        const handleHeight = handle.getBoundingClientRect().height;
+
+        const handleSpan = isVertical
+            ? handle.getBoundingClientRect().height
+            : handle.getBoundingClientRect().width;
+
         const controlbarBounds = document.getElementById("noVNC_control_bar")
             .getBoundingClientRect();
+        const controlbarBoundsStart = isVertical
+            ? controlbarBounds.top
+            : controlbarBounds.left;
+        const controlbarBoundsSpan  = isVertical
+            ? controlbarBounds.height
+            : controlbarBounds.width;
+
         const margin = 10;
 
         // These heights need to be non-zero for the below logic to work
-        if (handleHeight === 0 || controlbarBounds.height === 0) {
+        if (handleSpan === 0 || controlbarBoundsSpan === 0) {
             return;
         }
 
-        let newY = viewportRelativeY;
+        let newCoord = viewportRelativeCoord;
 
         // Check if the coordinates are outside the control bar
-        if (newY < controlbarBounds.top + margin) {
-            // Force coordinates to be below the top of the control bar
-            newY = controlbarBounds.top + margin;
+        if (newCoord < controlbarBoundsStart + margin) {
+            // Force coordinates to be below the start of the control bar
+            newCoord = controlbarBoundsStart + margin;
 
-        } else if (newY > controlbarBounds.top +
-                   controlbarBounds.height - handleHeight - margin) {
-            // Force coordinates to be above the bottom of the control bar
-            newY = controlbarBounds.top +
-                controlbarBounds.height - handleHeight - margin;
+        } else if (newCoord > controlbarBoundsStart +
+                   controlbarBoundsSpan - handleSpan - margin) {
+            // Force coordinates to be before the end of the control bar
+            newCoord = controlbarBoundsStart +
+                controlbarBoundsSpan - handleSpan - margin;
         }
 
         // Corner case: control bar too small for stable position
-        if (controlbarBounds.height < (handleHeight + margin * 2)) {
-            newY = controlbarBounds.top +
-                (controlbarBounds.height - handleHeight) / 2;
+        if (controlbarBoundsSpan < (handleSpan + margin * 2)) {
+            newCoord = controlbarBoundsStart +
+                (controlbarBoundsSpan - handleSpan) / 2;
         }
 
         // The transform needs coordinates that are relative to the parent
-        const parentRelativeY = newY - controlbarBounds.top;
-        handle.style.transform = "translateY(" + parentRelativeY + "px)";
+        const parentRelativeCoord = newCoord - controlbarBoundsStart;
+        if (isVertical) {
+            handle.style.transform = "translateY(" + parentRelativeCoord + "px)";
+        } else {
+            handle.style.transform = "translateX(" + parentRelativeCoord + "px)";
+        }
     },
 
     updateControlbarHandle() {
@@ -690,7 +757,15 @@ const UI = {
         // the move function expects coordinates relative the the viewport.
         const handle = document.getElementById("noVNC_control_bar_handle");
         const handleBounds = handle.getBoundingClientRect();
-        UI.moveControlbarHandle(handleBounds.top);
+
+        const controlBarPos = UI.getControlbarPos();
+        const isVertical = controlBarPos === 'left' || controlBarPos === 'right';
+
+        if (isVertical) {
+            UI.moveControlbarHandle(handleBounds.top, true);
+        } else {
+            UI.moveControlbarHandle(handleBounds.left, false);
+        }
     },
 
     controlbarHandleMouseUp(e) {
@@ -728,6 +803,8 @@ const UI = {
 
         UI.controlbarMouseDownClientY = ptr.clientY;
         UI.controlbarMouseDownOffsetY = ptr.clientY - bounds.top;
+        UI.controlbarMouseDownClientX = ptr.clientX;
+        UI.controlbarMouseDownOffsetX = ptr.clientX - bounds.left;
         e.preventDefault();
         e.stopPropagation();
         UI.keepControlbar();
@@ -1072,6 +1149,10 @@ const UI = {
             url.protocol = (window.location.protocol === "https:") ? 'wss:' : 'ws:';
         }
 
+        if (UI.getSetting('keep_device_awake')) {
+            UI.wakeLockManager.acquire();
+        }
+
         try {
             UI.rfb = new RFB(document.getElementById('noVNC_container'),
                              url.href,
@@ -1155,6 +1236,8 @@ const UI = {
         UI.showStatus(msg);
         UI.updateVisualState('connected');
 
+        UI.updateBeforeUnload();
+
         // Do this last because it can only be used on rendered elements
         UI.rfb.focus();
     },
@@ -1169,6 +1252,7 @@ const UI = {
         UI.connected = false;
 
         UI.rfb = undefined;
+        UI.wakeLockManager.release();
 
         if (!e.detail.clean) {
             UI.updateVisualState('disconnected');
@@ -1191,6 +1275,8 @@ const UI = {
             UI.showStatus(_("Disconnected"), 'normal');
         }
 
+        UI.updateBeforeUnload();
+
         document.title = PAGE_TITLE;
 
         UI.openControlbar();
@@ -1198,7 +1284,7 @@ const UI = {
     },
 
     securityFailed(e) {
-        let msg = "";
+        let msg;
         // On security failures we might get a string with a reason
         // directly from the server. Note that we can't control if
         // this string is translated or not.
@@ -1209,6 +1295,24 @@ const UI = {
             msg = _("New connection has been rejected");
         }
         UI.showStatus(msg, 'error');
+    },
+
+    handleBeforeUnload(e) {
+        // Trigger a "Leave site?" warning prompt before closing the
+        // page. Modern browsers (Oct 2025) accept either (or both)
+        // preventDefault() or a nonempty returnValue, though the latter is
+        // considered legacy. The custom string is ignored by modern browsers,
+        // which display a native message, but older browsers will show it.
+        e.preventDefault();
+        e.returnValue = _("Are you sure you want to disconnect the session?");
+    },
+
+    updateBeforeUnload() {
+        // Remove first to avoid adding duplicates
+        window.removeEventListener("beforeunload", UI.handleBeforeUnload);
+        if (!UI.rfb?.viewOnly && UI.connected) {
+            window.addEventListener("beforeunload", UI.handleBeforeUnload);
+        }
     },
 
 /* ------^-------
@@ -1257,13 +1361,13 @@ const UI = {
         let inputFocus = "none";
         if (e.detail.types.indexOf("username") === -1) {
             document.getElementById("noVNC_username_block").classList.add("noVNC_hidden");
-        } else {
-            inputFocus = inputFocus === "none" ? "noVNC_username_input" : inputFocus;
+        } else if (document.getElementById("noVNC_username_input").value === "") {
+            inputFocus = "noVNC_username_input";
         }
         if (e.detail.types.indexOf("password") === -1) {
             document.getElementById("noVNC_password_block").classList.add("noVNC_hidden");
-        } else {
-            inputFocus = inputFocus === "none" ? "noVNC_password_input" : inputFocus;
+        } else if (inputFocus === "none") {
+            inputFocus = "noVNC_password_input";
         }
         document.getElementById('noVNC_credentials_dlg')
             .classList.add('noVNC_open');
@@ -1737,6 +1841,8 @@ const UI = {
         if (!UI.rfb) return;
         UI.rfb.viewOnly = UI.getSetting('view_only');
 
+        UI.updateBeforeUnload();
+
         // Hide input related buttons in view only mode
         if (UI.rfb.viewOnly) {
             document.getElementById('noVNC_keyboard_button')
@@ -1794,6 +1900,16 @@ const UI = {
         // Display the desktop name in the document title
         document.title = e.detail.name + " - " + PAGE_TITLE;
     },
+
+    updateRequestWakelock() {
+        if (!UI.rfb) return;
+        if (UI.getSetting('keep_device_awake')) {
+            UI.wakeLockManager.acquire();
+        } else {
+            UI.wakeLockManager.release();
+        }
+    },
+
 
     bell(e) {
         if (UI.getSetting('bell') === 'on') {

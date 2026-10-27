@@ -77,11 +77,6 @@ protocol stream.
     if the remote session is smaller than its container, or handled
     according to `clipViewport` if it is larger. Disabled by default.
 
-`showDotCursor`
-  - Is a `boolean` indicating whether a dot cursor should be shown
-    instead of a zero-sized or fully-transparent cursor if the server
-    sets such invisible cursor. Disabled by default.
-
 `viewOnly`
   - Is a `boolean` indicating if any events (e.g. key presses or mouse
     movement) should be prevented from being sent to the server.
@@ -266,7 +261,7 @@ property is an `Object` containing the property `types` which is an
 
 The `connect` event is fired after all the handshaking with the server
 is completed and the connection is fully established. After this event
-the `RFB` object is ready to recieve graphics updates and to send input.
+the `RFB` object is ready to receive graphics updates and to send input.
 
 #### desktopname
 
